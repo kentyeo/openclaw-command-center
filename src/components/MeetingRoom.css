@@ -119,6 +119,44 @@
 }
 .meeting-dept-chip.selected { background: var(--accent-muted); color: var(--accent-color); }
 
+/* Round member composition chips (chat input + negotiate form) */
+.meeting-target-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 16px 0;
+}
+.meeting-target-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.meeting-target-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0.55;
+  transition: opacity .15s ease;
+}
+.meeting-target-chip.selected {
+  opacity: 1;
+  background: var(--accent-muted);
+  color: var(--accent-color);
+}
+.meeting-target-chip.all {
+  opacity: 0.8;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .meeting-create-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
 .meeting-participants {

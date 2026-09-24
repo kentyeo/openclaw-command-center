@@ -335,8 +335,8 @@ export default function OfficeCanvas({ departments, selectedDeptId, onSelectDept
           .map(t => ({ ...t, dist: Math.abs(t.col - centerCol) + Math.abs(t.row - centerRow) }))
           .sort((a, b) => a.dist - b.dist)
 
-        const participants = event.deptIds
-          .map((deptId) => depts.findIndex(d => d.id === deptId))
+        const participants = event.agentIds
+          .map((agentId) => depts.findIndex(d => d.agent === agentId))
           .filter((idx) => idx >= 0)
 
         participants.forEach((agentIdx, i) => {
@@ -358,8 +358,8 @@ export default function OfficeCanvas({ departments, selectedDeptId, onSelectDept
           }, walkTime + 500)
         })
       } else if (event.type === 'end') {
-        const participants = event.deptIds
-          .map((deptId) => depts.findIndex(d => d.id === deptId))
+        const participants = event.agentIds
+          .map((agentId) => depts.findIndex(d => d.agent === agentId))
           .filter((idx) => idx >= 0)
 
         participants.forEach((agentIdx) => {

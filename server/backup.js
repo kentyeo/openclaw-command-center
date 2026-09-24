@@ -96,7 +96,7 @@ function backupFile(filePath) {
   try {
     // Skip if file doesn't exist
     if (!fs.existsSync(filePath)) {
-      log.debug('Skipping non-existent file', { filePath });
+      log.info('Skipping non-existent file', { filePath });
       return { success: false, reason: 'not_found' };
     }
 

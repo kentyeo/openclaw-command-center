@@ -12,7 +12,7 @@ const HEARTBEAT_INTERVAL_MS = 25000;
 const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30000; // 30s max delay with exponential backoff
 const RECONNECT_MAX_ATTEMPTS = 5; // Stop retrying after N consecutive failures
-const REQUEST_TIMEOUT_MS = 120000; // 2 minutes for AI chat requests
+const REQUEST_TIMEOUT_MS = 360000; // 6 minutes for AI chat requests
 const REQUEST_TIMEOUT_NORMAL_MS = 30000; // 30s for normal requests
 const MAX_STREAM_BUFFER_BYTES = 1048576; // 1MB per stream buffer
 const MAX_PENDING_REQUESTS = 100; // Maximum concurrent pending requests
@@ -842,14 +842,7 @@ class GatewayClient {
 
     this.reconnectAttempt++;
 
-    if (this.reconnectAttempt > RECONNECT_MAX_ATTEMPTS) {
-      // If already in background retry mode, don't start another
-      if (this._inBackgroundRetry) return;
-      gLog.warn(`Max reconnect attempts (${RECONNECT_MAX_ATTEMPTS}) reached. Will retry every 5 minutes in background.`);
-      this._scheduleBackgroundRetry();
-      return;
-    }
-
+    // Never give up: exponential backoff capped at 30s, retry forever
     const baseDelay = Math.min(
       RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempt - 1),
       RECONNECT_MAX_DELAY_MS
@@ -859,7 +852,7 @@ class GatewayClient {
     const jitter = 0.5 + Math.random() * 0.5;
     const delay = Math.floor(baseDelay * jitter);
 
-    gLog.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})...`);
+    gLog.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})...`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect().catch(err => {
@@ -1071,7 +1064,7 @@ class GatewayClient {
           id: requestId,
           method: 'agent',
           params: {
-            agentId: 'main',
+            agentId: options.agentId || 'main',
             sessionKey,
             message,
             attachments: attachments.length > 0 ? attachments : [],
@@ -1108,7 +1101,7 @@ class GatewayClient {
       id: requestId,
       method: 'agent',
       params: {
-        agentId: 'main',
+        agentId: options.agentId || 'main',
         sessionKey,
         message,
         attachments: attachments.length > 0 ? attachments : [],

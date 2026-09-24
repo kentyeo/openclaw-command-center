@@ -142,12 +142,12 @@ interface BaseMeetingEvent {
 interface MeetingStartEvent extends BaseMeetingEvent {
   type: 'start'
   topic?: string
-  deptIds: string[]
+  agentIds: string[]
 }
 
 interface MeetingEndEvent extends BaseMeetingEvent {
   type: 'end'
-  deptIds: string[]
+  agentIds: string[]
 }
 
 // Negotiation events
@@ -159,7 +159,7 @@ interface NegotiationStartEvent extends BaseMeetingEvent {
 
 interface NegotiationVoteEvent extends BaseMeetingEvent {
   type: 'meeting:negotiation-vote'
-  deptId: string
+  agentId: string
   stance: 'agree' | 'disagree' | 'modify' | 'abstain'
   reason: string
   suggestion?: string
@@ -176,7 +176,7 @@ interface NegotiationRoundEvent extends BaseMeetingEvent {
 
 interface NegotiationEndEvent extends BaseMeetingEvent {
   type: 'meeting:negotiation-end'
-  result: 'accepted' | 'rejected' | 'timeout'
+  result: 'consensus' | 'majority' | 'no-consensus' | 'timeout'
   agreeCount: number
   total: number
 }
@@ -226,14 +226,14 @@ export function useMeetingEvents(): readonly MeetingEvent[] {
   )
 }
 
-// Meeting department responses store — decoupled for real-time updates
+// Meeting agent responses store — decoupled for real-time updates
 interface MeetingDeptResponse {
   meetingId: string
-  deptId: string
+  agentId: string
   text: string
   roundId: string
-  deptIndex: number
-  totalDepts: number
+  agentIndex: number
+  totalAgents: number
   timestamp: number
 }
 
@@ -717,7 +717,7 @@ export function useAgentState() {
           type: 'start',
           meetingId: (d.meetingId as string) || '',
           topic: (d.topic as string) || '',
-          deptIds: (d.deptIds as string[]) || [],
+          agentIds: (d.agentIds as string[]) || [],
           timestamp: Date.now()
         })
         emitMeetingChange()
@@ -728,7 +728,7 @@ export function useAgentState() {
         meetingEvents.push({
           type: 'end',
           meetingId: (d.meetingId as string) || '',
-          deptIds: (d.deptIds as string[]) || [],
+          agentIds: (d.agentIds as string[]) || [],
           timestamp: Date.now()
         })
         emitMeetingChange()
@@ -749,15 +749,15 @@ export function useAgentState() {
         emitMeetingChange()
         break
 
-      case 'meeting:dept-response':
+      case 'meeting:agent-response':
         if (meetingDeptResponses.length >= MAX_EVENT_QUEUE) meetingDeptResponses = meetingDeptResponses.slice(-50)
         meetingDeptResponses.push({
           meetingId: (d.meetingId as string) || '',
-          deptId: (d.deptId as string) || '',
+          agentId: (d.agentId as string) || '',
           text: (d.text as string) || '',
           roundId: (d.roundId as string) || '',
-          deptIndex: (d.deptIndex as number) || 0,
-          totalDepts: (d.totalDepts as number) || 0,
+          agentIndex: (d.agentIndex as number) || 0,
+          totalAgents: (d.totalAgents as number) || 0,
           timestamp: (d.timestamp as number) || Date.now()
         })
         emitMeetingDeptChange()

@@ -440,6 +440,16 @@ function getSessionKey(deptId) {
   return `agent:main:${deptId}`;
 }
 
+/**
+ * Build the gateway session key for a REAL agent (not a department).
+ * Maps agentId -> `agent:{agentId}:{scope}` so the gateway routes to that agent's own model/persona.
+ */
+function getAgentSessionKey(agentId, scope) {
+  const normalized = String(agentId || 'main').trim();
+  const scopePart = scope ? ':' + String(scope).trim() : '';
+  return `agent:${normalized}${scopePart}`;
+}
+
 // ---- Sub-agent persistence ----
 
 function subAgentsPath(deptId) {
@@ -596,6 +606,105 @@ async function chat(deptId, userMessage, images, options = {}) {
     }
   }
   // Safety net: should never reach here
+  return { success: false, error: 'Exhausted all retry attempts' };
+}
+
+/**
+ * Chat with a REAL agent (not a department).
+ * Routes the message to the agent's own session so it answers with its own
+ * model + persona (configured in openclaw.json). No department context is injected.
+ */
+async function chatAgent(agentId, userMessage, images, options = {}) {
+  const traceId = options.traceId || '';
+  const gateway = getGateway();
+
+  if (!gateway.isReady) {
+    try {
+      await gateway.waitForReady(15000);
+    } catch {
+      return { success: false, error: 'Gateway not connected, please try again later' };
+    }
+  }
+
+  const sessionKey = getAgentSessionKey(agentId, options.scope || 'meeting');
+  const wrappedMessage = userMessage;
+
+  // Build attachments from base64 images
+  const attachments = [];
+  if (Array.isArray(images)) {
+    for (const dataUrl of images) {
+      if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
+        const match = dataUrl.match(/^data:(image\/[^;]+);base64,(.+)$/);
+        if (match) {
+          attachments.push({ mimeType: match[1], data: match[2] });
+        }
+      }
+    }
+  }
+
+  // H1 fix: Retry logic with exponential backoff for transient errors (max 2 retries)
+  const MAX_RETRIES = 2;
+  const RETRY_DELAYS = [1000, 3000];
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const startMs = Date.now();
+      const result = await gateway.sendAgentMessage(sessionKey, wrappedMessage, attachments, { traceId, agentId });
+      const durationMs = Date.now() - startMs;
+
+      const hasToolResults = result.toolResults && Array.isArray(result.toolResults) && result.toolResults.length > 0;
+      const hasText = result.text && result.text.trim().length > 0;
+
+      if (hasText || hasToolResults) {
+        let replyText = result.text || '';
+        if (Buffer.byteLength(replyText, 'utf8') > MAX_RESPONSE_SIZE) {
+          log.warn(`ChatAgent ${agentId} response truncated from ${Buffer.byteLength(replyText, 'utf8')} to ${MAX_RESPONSE_SIZE} bytes`, { traceId, agentId });
+          replyText = replyText.substring(0, MAX_RESPONSE_SIZE);
+        }
+
+        recordChat(agentId, durationMs, false);
+        if (result.usage) {
+          recordTokens(agentId, result.usage);
+        }
+        log.info(`ChatAgent ${agentId} completed in ${durationMs}ms (text=${hasText}, tools=${hasToolResults})`, { traceId, agentId, durationMs });
+        return { success: true, reply: replyText };
+      }
+
+      recordChat(agentId, durationMs, true);
+      log.warn(`ChatAgent ${agentId} empty response (no text or tool results)`, { traceId, agentId, durationMs });
+      return { success: false, error: 'Gateway returned empty response' };
+    } catch (err) {
+      const isTransient = err.message.includes('timeout') ||
+        err.message.includes('connection lost') ||
+        err.message.includes('Gateway connection lost') ||
+        err.message.includes('WebSocket not open') ||
+        err.message.includes('ECONNREFUSED') ||
+        err.message.includes('ETIMEDOUT') ||
+        /5\d{2}/.test(err.message);
+
+      const isClientError = /4\d{2}/.test(err.message) ||
+        err.message.includes('Invalid request') ||
+        err.message.includes('Bad request');
+
+      if (isTransient && !isClientError && attempt < MAX_RETRIES) {
+        const delay = RETRY_DELAYS[attempt];
+        log.warn(`ChatAgent ${agentId} transient error (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms: ${err.message}`, { traceId, agentId, attempt: attempt + 1, delay });
+        await new Promise(r => setTimeout(r, delay));
+        if (!gateway.isReady) {
+          try {
+            await gateway.waitForReady(15000);
+          } catch (waitErr) {
+            log.warn(`Gateway not ready after retry wait: ${waitErr.message}`, { traceId, agentId });
+          }
+        }
+        continue;
+      }
+
+      log.error(`ChatAgent ${agentId} error (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${err.message}`, { traceId, agentId, isTransient, isClientError });
+      recordChat(agentId, 0, true);
+      return { success: false, error: err.message };
+    }
+  }
   return { success: false, error: 'Exhausted all retry attempts' };
 }
 
@@ -1177,7 +1286,7 @@ function startSubAgentCleanup() {
 // Note: setWss is already exported above as a named export
 
 export {
-  chat, chatAsync, getChatHistory, getSessionKey,
+  chat, chatAgent, chatAsync, getChatHistory, getSessionKey, getAgentSessionKey,
   saveBulletin, saveMemory, clearHistory, loadMemory, loadBulletin,
   createSubAgent, chatSubAgent, listSubAgents, removeSubAgent,
   broadcastCommand,

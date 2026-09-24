@@ -281,11 +281,14 @@ export default function ChatInput({
 
   const handleSend = () => {
     if ((!text.trim() && pendingImages.length === 0 && pendingDocs.length === 0) || sending || !selectedDeptId) return
-    onSendMessage(text.trim(), pendingImages, pendingDocs)
+    // BUG1 fix: clear the input BEFORE calling send — if send throws
+    // synchronously, the box must not keep stale text after the message
+    // was already delivered (text was captured in the argument above).
     setText('')
     setPendingImages([])
     setPendingDocs([])
     setShowCmdHints(false)
+    onSendMessage(text.trim(), pendingImages, pendingDocs)
   }
 
   const selectCommand = (cmd: string) => {

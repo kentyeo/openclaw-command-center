@@ -1,6 +1,6 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
-import { chat, sanitizeContextTags } from '../agent.js';
+import { chatAgent, sanitizeContextTags } from '../agent.js';
 import { hasDriveAuth, getDriveClient, getOrCreateBackupFolder, getDriveConfig } from './drive.js';
 import { notify } from './notifications.js';
 import { Readable } from 'stream';
@@ -20,18 +20,41 @@ const router = express.Router();
 const meetings = new Map();
 
 // Constants
-const MAX_ACTIVE_MEETINGS = 10;
+const MAX_ACTIVE_MEETINGS = 50;
 const MAX_MESSAGES_PER_MEETING = 200;  // H7 Fix: Cap at 200 messages
 
 // Meeting ID format: mtg_ + 12 hex chars
 const VALID_MEETING_ID = /^mtg_[a-f0-9]{12}$/;
-const DEPT_RESPONSE_TIMEOUT = 180000; // 3 minutes
+const DEPT_RESPONSE_TIMEOUT = 60000; // 60s — skip slow agents (Kimi daytime rate limiting)
 const NEGOTIATION_TIMEOUT = 600000; // 10 minutes
 
 // Ensure meetings directory exists
 const MEETINGS_DIR = path.join(BASE_PATH, 'departments', 'meetings');
 if (!fs.existsSync(MEETINGS_DIR)) {
   fs.mkdirSync(MEETINGS_DIR, { recursive: true });
+}
+
+/**
+ * Parse agent reply into { reasoning, conclusion }.
+ * Splits on the 【结论】 marker: everything before is reasoning,
+ * everything after is conclusion. If the marker is missing,
+ * returns { reasoning: '', conclusion: '' } so callers can
+ * fall back to displaying the full reply text.
+ */
+function parseAgentReply(reply) {
+  if (typeof reply !== 'string') {
+    return { reasoning: '', conclusion: '' };
+  }
+  const idx = reply.indexOf('【结论】');
+  if (idx === -1) {
+    return { reasoning: '', conclusion: '' };
+  }
+  const reasoning = reply
+    .slice(0, idx)
+    .replace(/^【思考过程】/, '')
+    .trim();
+  const conclusion = reply.slice(idx + '【结论】'.length).trim();
+  return { reasoning, conclusion };
 }
 
 // Load meetings from disk on startup (async with parallel file reads)
@@ -51,7 +74,7 @@ async function loadMeetingsFromDisk() {
       try {
         const content = await fs.promises.readFile(path.join(dir, file), 'utf8');
         const data = JSON.parse(content);
-        if (data.id && data.status === 'active') {
+        if (data.id && (data.status === 'active' || data.status === 'ended')) {
           return data;
         }
       } catch (err) {
@@ -139,42 +162,38 @@ async function persistMeeting(meeting) {
 /**
  * POST /api/meetings
  * Create a new meeting with selected departments
- * Body: { topic: string, deptIds: string[], initiatorDeptId: string }
+ * Body: { topic: string, agentIds: string[], initiatorAgentId: string }
  */
 router.post('/', async (req, res) => {
-  const { topic, deptIds, initiatorDeptId } = req.body;
-  if (!topic || typeof topic !== 'string' || !Array.isArray(deptIds) || deptIds.length < 2) {
-    return res.status(400).json({ error: 'topic and at least 2 deptIds required' });
+  const { topic, agentIds, initiatorAgentId } = req.body;
+  if (!topic || typeof topic !== 'string' || !Array.isArray(agentIds) || agentIds.length < 2) {
+    return res.status(400).json({ error: 'topic and at least 2 agentIds required' });
   }
   if (topic.length > 500) {
     return res.status(400).json({ error: 'topic must be 500 characters or less' });
   }
-  if (deptIds.length > 20 || !deptIds.every(id => typeof id === 'string' && id.length <= 50)) {
-    return res.status(400).json({ error: 'invalid deptIds' });
+  if (agentIds.length > 20 || !agentIds.every(id => typeof id === 'string' && id.length <= 50)) {
+    return res.status(400).json({ error: 'invalid agentIds' });
   }
 
   // Use mutex to prevent TOCTOU race condition on meeting creation
   const result = await withMutex('meeting-creation', async () => {
-    // P0 Fix #1: Unbounded meeting creation - enforce limit
-    const activeMeetingsCount = [...meetings.values()].filter(m => m.status === 'active').length;
-    if (activeMeetingsCount >= MAX_ACTIVE_MEETINGS) {
-      return {
-        error: true,
-        status: 429,
-        data: {
-          error: 'Maximum active meetings limit reached',
-          limit: MAX_ACTIVE_MEETINGS,
-          active: activeMeetingsCount
-        }
-      };
+    // Auto-end all existing active meetings before creating a new one (only 1 active at a time)
+    const activeMeetings = [...meetings.values()].filter(m => m.status === 'active');
+    for (const oldMtg of activeMeetings) {
+      oldMtg.status = 'ended';
+      oldMtg.endedAt = Date.now();
+      await persistMeeting(oldMtg);
+      log.info(`Auto-ended ${oldMtg.id} (new meeting starting)`);
+      recordAudit({ action: 'meeting:auto-end', target: oldMtg.id, details: { reason: 'superseded' }, ip: req.ip });
     }
 
     const meetingId = 'mtg_' + randomUUID().replace(/-/g, '').substring(0, 12);
     const meeting = {
       id: meetingId,
       topic,
-      deptIds,
-      initiatorDeptId: initiatorDeptId || deptIds[0],
+      agentIds,
+      initiatorAgentId: initiatorAgentId || agentIds[0],
       messages: [],
       status: 'active',
       createdAt: Date.now(),
@@ -182,8 +201,8 @@ router.post('/', async (req, res) => {
     meetings.set(meetingId, meeting);
     await persistMeeting(meeting);
 
-    log.info(`Created ${meetingId}: ${topic} with ${deptIds.join(', ')}`);
-    recordAudit({ action: 'meeting:create', target: meetingId, details: { topic, deptIds }, ip: req.ip });
+    log.info(`Created ${meetingId}: ${topic} with ${agentIds.join(', ')}`);
+    recordAudit({ action: 'meeting:create', target: meetingId, details: { topic, agentIds }, ip: req.ip });
 
     return { error: false, meeting, meetingId };
   });
@@ -203,7 +222,7 @@ router.post('/', async (req, res) => {
         data: {
           meetingId: meeting.id,
           topic: meeting.topic,
-          deptIds: meeting.deptIds
+          agentIds: meeting.agentIds
         },
         timestamp: new Date().toISOString()
       });
@@ -223,14 +242,18 @@ router.post('/', async (req, res) => {
  * List active meetings
  */
 router.get('/', (req, res) => {
+  // BUG2 fix: list BOTH active and ended meetings (newest first) so
+  // historical meeting records stay visible in the UI.
   const list = [...meetings.values()]
-    .filter(m => m.status === 'active')
+    .sort((a, b) => b.createdAt - a.createdAt)
     .map(m => ({
       id: m.id,
       topic: m.topic,
-      deptIds: m.deptIds,
+      agentIds: m.agentIds,
       messageCount: m.messages.length,
-      createdAt: m.createdAt
+      status: m.status,
+      createdAt: m.createdAt,
+      endedAt: m.endedAt || null
     }));
   res.json({ meetings: list });
 });
@@ -250,10 +273,13 @@ router.get('/:id', (req, res) => {
 
 /**
  * POST /api/meetings/:id/message
- * Send a message to the meeting — broadcasts to ALL departments in the meeting
- * Body: { message: string, fromDeptId?: string }
+ * Send a message to the meeting — broadcasts to ALL members, or a chosen subset
+ * Body: { message: string, fromAgentId?: string, targetAgentIds?: string[] }
  *
- * If fromDeptId is provided, the message is sent as context to all OTHER departments.
+ * If targetAgentIds is provided, ONLY those members receive and answer the message
+ * (others stay in the meeting but are not disturbed).
+ *
+ * If fromAgentId is provided, the message is sent as context to all OTHER agents.
  * Each department gets the meeting context + conversation history and generates a response.
  * This creates REAL cross-department interaction.
  *
@@ -271,13 +297,22 @@ router.post('/:id/message', async (req, res) => {
     return res.status(400).json({ error: 'Cannot send message to ended meeting' });
   }
 
-  const { message, fromDeptId } = req.body;
+  const { message, fromAgentId, targetAgentIds } = req.body;
   if (!message || typeof message !== 'string') return res.status(400).json({ error: 'message required' });
   if (message.length > 10000) {
     return res.status(400).json({ error: 'Message too long (max 10000 chars)' });
   }
-  if (fromDeptId !== undefined && (typeof fromDeptId !== 'string' || fromDeptId.length > 50)) {
-    return res.status(400).json({ error: 'Invalid fromDeptId' });
+  if (fromAgentId !== undefined && (typeof fromAgentId !== 'string' || fromAgentId.length > 50)) {
+    return res.status(400).json({ error: 'Invalid fromAgentId' });
+  }
+  // Optional: limit this round to a chosen subset of meeting members
+  let targetAgentsFilter = null;
+  if (targetAgentIds !== undefined) {
+    if (!Array.isArray(targetAgentIds) || targetAgentIds.length === 0 ||
+        !targetAgentIds.every(id => typeof id === 'string' && meeting.agentIds.includes(id))) {
+      return res.status(400).json({ error: 'Invalid targetAgentIds: must be a non-empty array of meeting members' });
+    }
+    targetAgentsFilter = new Set(targetAgentIds);
   }
 
   const roundId = randomUUID();
@@ -287,8 +322,8 @@ router.post('/:id/message', async (req, res) => {
 
   // Record user/initiator message
   meeting.messages.push({
-    role: fromDeptId ? 'dept' : 'user',
-    deptId: fromDeptId || 'user',
+    role: fromAgentId ? 'agent' : 'user',
+    agentId: fromAgentId || 'user',
     text: safeMessage,
     timestamp: Date.now(),
   });
@@ -302,54 +337,67 @@ router.post('/:id/message', async (req, res) => {
 
   await persistMeeting(meeting);
 
-  // Send to all departments in meeting (real Gateway calls)
-  const targetDepts = fromDeptId
-    ? meeting.deptIds.filter(id => id !== fromDeptId)
-    : meeting.deptIds;
+  // Send to chosen members only (targetAgentIds), otherwise all agents in meeting
+  const targetAgents = targetAgentsFilter
+    ? meeting.agentIds.filter(id => targetAgentsFilter.has(id))
+    : fromAgentId
+      ? meeting.agentIds.filter(id => id !== fromAgentId)
+      : meeting.agentIds;
 
   // Return immediately - processing happens in background
-  res.json({ status: 'accepted', roundId, targetDepts: targetDepts.length });
+  res.json({ status: 'accepted', roundId, targetAgents: targetAgents.length });
 
-  // Process departments in background
+  // Process agents in background
   const wss = req.app.locals.wss;
   setImmediate(async () => {
     try { await withMutex(`meeting:${meeting.id}`, async () => {
       const results = [];
 
-      // Sequential: each dept sees previous depts' responses (real discussion)
-      for (let deptIndex = 0; deptIndex < targetDepts.length; deptIndex++) {
-      const deptId = targetDepts[deptIndex];
+      // Sequential: each agent sees previous agents' responses (real discussion)
+      for (let agentIndex = 0; agentIndex < targetAgents.length; agentIndex++) {
+      const agentId = targetAgents[agentIndex];
 
       // Rebuild context each iteration so new responses are visible
       const recentHistory = meeting.messages.slice(-20).map(m => {
-        const sender = m.deptId === 'user' ? '用户' : m.deptId;
+        const sender = m.agentId === 'user' ? '用户' : m.agentId;
         return `[${sender}]: ${m.text}`;
       }).join('\n');
 
       const safeTopic = sanitizeContextTags(meeting.topic);
       const meetingPrompt = `[会议模式] 主题: <user_topic>${safeTopic}</user_topic>
-参会部门: ${meeting.deptIds.join(', ')}
+参会成员: ${meeting.agentIds.join(', ')}
 
 最近对话:
 ${recentHistory}
 
-你是 ${deptId} 部门。请根据你的部门专长，回应会议中的讨论。注意其他部门已经发表的观点，不要重复，提出你的独特视角。简洁回答，不超过200字。`;
+请根据你的专长回应会议中的讨论。注意其他成员已经发表的观点，不要重复，提出你的独特视角。请严格按以下格式输出（必须包含两个标记，先写思考过程，再写结论）：
+
+【思考过程】
+（在这里写出你的分析推理过程，尽量具体，不超过500字）
+
+【结论】
+（在这里写出你的最终回答，不超过200字，简洁明确）`;
 
       try {
-        // P0 Fix #3: Add timeout for department response
+        // P0 Fix #3: Add timeout for agent response
         const result = await Promise.race([
-          chat(deptId, meetingPrompt, null, { traceId: req.traceId }),
+          chatAgent(agentId, meetingPrompt, null, { traceId: req.traceId, scope: `meeting:${meeting.id}` }),
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Department response timeout')), DEPT_RESPONSE_TIMEOUT)
+            setTimeout(() => reject(new Error('Agent response timeout')), DEPT_RESPONSE_TIMEOUT)
           )
         ]);
         const reply = result.success ? result.reply : `[Error] ${result.error}`;
 
-        // Record department response — next dept will see this
+        // Split reply into reasoning + conclusion for display
+        const { reasoning, conclusion } = parseAgentReply(reply);
+
+        // Record agent response — next agent will see this
         meeting.messages.push({
-          role: 'dept',
-          deptId,
+          role: 'agent',
+          agentId,
           text: reply,
+          reasoning,
+          conclusion,
           timestamp: Date.now(),
         });
 
@@ -363,19 +411,21 @@ ${recentHistory}
         // P0 Fix #5: Move persistMeeting inside withMutex
         await persistMeeting(meeting);
 
-        results.push({ deptId, reply, success: result.success });
+        results.push({ agentId, reply, success: result.success });
 
-        // Broadcast department response immediately via WebSocket
+        // Broadcast agent response immediately via WebSocket
         if (wss) {
           safeBroadcast(wss, {
-            event: 'meeting:dept-response',
+            event: 'meeting:agent-response',
             data: {
               meetingId: meeting.id,
-              deptId,
+              agentId,
               text: reply,
+              reasoning,
+              conclusion,
               roundId,
-              deptIndex,
-              totalDepts: targetDepts.length,
+              agentIndex,
+              totalAgents: targetAgents.length,
               timestamp: Date.now(),
             },
           });
@@ -384,15 +434,15 @@ ${recentHistory}
         // P0 Fix #3: Handle timeout error specifically
         const isTimeout = err.message.includes('timeout');
         const errorReply = isTimeout
-          ? `[Timeout] ${deptId} did not respond within 3 minutes`
+          ? `[Timeout] ${agentId} 超过60秒未响应，跳过`
           : `[Error] ${err.message}`;
 
-        log.info(`Department ${deptId} ${isTimeout ? 'timed out' : 'error'}: ${err.message}`);
+        log.info(`Agent ${agentId} ${isTimeout ? 'timed out' : 'error'}: ${err.message}`);
 
         // Record error in messages
         meeting.messages.push({
-          role: 'dept',
-          deptId,
+          role: 'agent',
+          agentId,
           text: errorReply,
           timestamp: Date.now(),
         });
@@ -407,19 +457,19 @@ ${recentHistory}
         // P0 Fix #5: Move persistMeeting inside withMutex
         await persistMeeting(meeting);
 
-        results.push({ deptId, reply: errorReply, success: false });
+        results.push({ agentId, reply: errorReply, success: false });
 
         // Broadcast error via WebSocket
         if (wss) {
           safeBroadcast(wss, {
-            event: 'meeting:dept-response',
+            event: 'meeting:agent-response',
             data: {
               meetingId: meeting.id,
-              deptId,
+              agentId,
               text: errorReply,
               roundId,
-              deptIndex,
-              totalDepts: targetDepts.length,
+              agentIndex,
+              totalAgents: targetAgents.length,
               timestamp: Date.now(),
               timeout: isTimeout
             },
@@ -447,6 +497,44 @@ ${recentHistory}
 });
 
 /**
+ * POST /api/meetings/:id/participants
+ * Add an agent to an active meeting (mid-meeting).
+ * Body: { agentId: string }
+ */
+router.post('/:id/participants', async (req, res) => {
+  if (!VALID_MEETING_ID.test(req.params.id)) {
+    return res.status(400).json({ error: 'Invalid meeting ID format' });
+  }
+  const meeting = meetings.get(req.params.id);
+  if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+  if (meeting.status !== 'active') {
+    return res.status(400).json({ error: 'Cannot add participant to ended meeting' });
+  }
+
+  const { agentId } = req.body;
+  if (!agentId || typeof agentId !== 'string' || agentId.length > 50) {
+    return res.status(400).json({ error: 'agentId required' });
+  }
+  if (meeting.agentIds.includes(agentId)) {
+    return res.status(400).json({ error: 'Agent already in meeting' });
+  }
+
+  meeting.agentIds.push(agentId);
+  await persistMeeting(meeting);
+  recordAudit({ action: 'meeting:add-participant', target: meeting.id, details: { agentId }, ip: req.ip });
+
+  meeting.messages.push({
+    role: 'system',
+    agentId: 'system',
+    text: `[加入会议] ${agentId} 加入了会议`,
+    timestamp: Date.now(),
+  });
+  await persistMeeting(meeting);
+
+  res.json({ success: true, meetingId: meeting.id, agentIds: meeting.agentIds });
+});
+
+/**
  * Helper: Generate markdown meeting minutes
  */
 function generateMeetingMinutes(meeting) {
@@ -457,17 +545,32 @@ function generateMeetingMinutes(meeting) {
   let markdown = `# 会议纪要: ${meeting.topic}\n\n`;
   markdown += `**时间**: ${startTime.toLocaleString('zh-CN', { hour12: false })} - ${endTime.toLocaleString('zh-CN', { hour12: false, timeStyle: 'short' })}\n`;
   markdown += `**时长**: ${duration} 分钟\n`;
-  markdown += `**参会部门**: ${meeting.deptIds.join(', ')}\n`;
-  markdown += `**发起部门**: ${meeting.initiatorDeptId}\n\n`;
+  markdown += `**参会成员**: ${meeting.agentIds.join(', ')}\n`;
+  markdown += `**发起成员**: ${meeting.initiatorAgentId}\n\n`;
   markdown += `---\n\n## 会议记录\n\n`;
 
-  // Chronological messages with sender and timestamp
+  // BUG3 fix: only real speaker messages (user/agent) are listed as 发言;
+  // system records (join/leave, negotiation, action items) go to a
+  // separate section instead of being framed as a speaker's words.
+  const speakerEntries = [];
+  const systemEntries = [];
   meeting.messages.forEach((msg, i) => {
     const time = new Date(msg.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
-    const sender = msg.deptId === 'user' ? '用户' : msg.deptId;
-    markdown += `### ${i + 1}. [${time}] ${sender}\n\n`;
-    markdown += `${msg.text}\n\n`;
+    const isSystem = msg.role === 'system' || msg.agentId === 'system' || msg.agentId === 'action-items' || msg.agentId === 'negotiation';
+    if (isSystem) {
+      systemEntries.push(`### ${i + 1}. [${time}] 系统\n\n${msg.text}\n\n`);
+    } else {
+      const sender = msg.role === 'user' || msg.agentId === 'user' ? '用户' : msg.agentId;
+      speakerEntries.push(`### ${i + 1}. [${time}] ${sender}\n\n${msg.text}\n\n`);
+    }
   });
+  if (speakerEntries.length > 0) {
+    markdown += speakerEntries.join('');
+  }
+  if (systemEntries.length > 0) {
+    markdown += `---\n\n## 系统记录（协商 / 决议 / 加入退出）\n\n`;
+    markdown += systemEntries.join('');
+  }
 
   markdown += `---\n\n`;
   markdown += `**会议ID**: ${meeting.id}\n`;
@@ -510,8 +613,8 @@ router.post('/:id/end', async (req, res) => {
     }
   });
 
-  // Schedule removal from memory (data is persisted to disk)
-  setTimeout(() => meetings.delete(meeting.id), 5 * 60 * 1000);
+  // BUG2 fix: keep ended meetings in memory + on disk so history stays
+  // visible; disk cleanup prunes files older than 30 days.
 
   // Broadcast meeting:end event to WebSocket clients
   try {
@@ -521,7 +624,7 @@ router.post('/:id/end', async (req, res) => {
         event: 'meeting:end',
         data: {
           meetingId: meeting.id,
-          deptIds: meeting.deptIds
+          agentIds: meeting.agentIds
         },
         timestamp: new Date().toISOString()
       });
@@ -610,7 +713,7 @@ async function extractActionItems(meeting, wss, traceId) {
 
   // Build transcript
   const transcript = meeting.messages.map(m => {
-    const sender = m.deptId === 'user' ? 'User' : m.deptId;
+    const sender = m.agentId === 'user' ? 'User' : m.agentId;
     return `[${sender}]: ${m.text}`;
   }).join('\n');
 
@@ -618,7 +721,7 @@ async function extractActionItems(meeting, wss, traceId) {
   const prompt = `Analyze this meeting transcript and extract action items.
 
 Meeting topic: <user_topic>${safeTopic}</user_topic>
-Departments: ${meeting.deptIds.join(', ')}
+Departments: ${meeting.agentIds.join(', ')}
 
 Transcript:
 ${transcript.substring(0, 8000)}
@@ -630,8 +733,8 @@ Extract 3-8 action items. Use actual department IDs from the transcript. Be spec
 
   try {
     // Use the first department to extract (or a specific dept if available)
-    const extractorDept = meeting.deptIds[0];
-    const result = await chat(extractorDept, prompt, null, { traceId });
+    const extractorAgent = meeting.agentIds[0];
+    const result = await chatAgent(extractorAgent, prompt, null, { traceId, scope: `meeting:${meeting.id}` });
 
     if (result.success && result.reply) {
       const jsonMatch = result.reply.match(/\[[\s\S]*?\]/);
@@ -642,7 +745,7 @@ Extract 3-8 action items. Use actual department IDs from the transcript. Be spec
 
         // Record in meeting messages (null-safe field access)
         meeting.messages.push({
-          role: 'system', deptId: 'action-items',
+          role: 'system', agentId: 'action-items',
           text: `[Action Items Extracted]\n${actionItems.map((item, i) =>
             `${i+1}. [${String(item.priority || 'medium').toUpperCase()}] ${String(item.task || '(no task)')} (Owner: ${String(item.owner || 'unassigned')}${item.deadline_hint ? ', ' + String(item.deadline_hint) : ''})`
           ).join('\n')}`,
@@ -690,7 +793,7 @@ router.post('/:id/negotiate', async (req, res) => {
   if (!VALID_MEETING_ID.test(id)) {
     return res.status(400).json({ error: 'Invalid meeting ID format' });
   }
-  const { proposal, maxRounds = 3 } = req.body;
+  const { proposal, maxRounds = 3, targetAgentIds } = req.body;
   const meeting = meetings.get(id);
   if (!meeting || meeting.status !== 'active') {
     return res.status(404).json({ error: 'Meeting not found or not active' });
@@ -699,6 +802,16 @@ router.post('/:id/negotiate', async (req, res) => {
   // Validate
   if (!proposal || typeof proposal !== 'string' || proposal.length > 5000) {
     return res.status(400).json({ error: 'Invalid proposal' });
+  }
+
+  // Optional: only these members participate in the negotiation
+  let participantAgents = null;
+  if (targetAgentIds !== undefined) {
+    if (!Array.isArray(targetAgentIds) || targetAgentIds.length === 0 ||
+        !targetAgentIds.every(id => typeof id === 'string' && meeting.agentIds.includes(id))) {
+      return res.status(400).json({ error: 'Invalid targetAgentIds: must be a non-empty array of meeting members' });
+    }
+    participantAgents = meeting.agentIds.filter(id => targetAgentIds.includes(id));
   }
 
   const roundsCapped = Math.min(Math.max(1, maxRounds), 5);
@@ -713,7 +826,7 @@ router.post('/:id/negotiate', async (req, res) => {
   Promise.resolve(withMutex(`meeting:${meeting.id}`, async () => {
     try {
       await Promise.race([
-        runNegotiation(meeting, proposal, roundsCapped, negotiationId, req.app.locals.wss, req.traceId),
+        runNegotiation(meeting, proposal, roundsCapped, negotiationId, req.app.locals.wss, req.traceId, participantAgents),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('Negotiation timeout')), NEGOTIATION_TIMEOUT)
         )
@@ -722,7 +835,7 @@ router.post('/:id/negotiate', async (req, res) => {
       if (err.message.includes('timeout')) {
         log.error('Negotiation timed out after 10 minutes');
         meeting.messages.push({
-          role: 'system', deptId: 'negotiation',
+          role: 'system', agentId: 'negotiation',
           text: '[Negotiation Timeout] Process exceeded 10 minutes and was terminated',
           timestamp: Date.now(), negotiationId
         });
@@ -742,15 +855,15 @@ router.post('/:id/negotiate', async (req, res) => {
 /**
  * Run negotiation rounds: each dept evaluates proposal and votes
  */
-async function runNegotiation(meeting, proposal, maxRounds, negotiationId, wss, traceId) {
-  const targetDepts = meeting.deptIds;
+async function runNegotiation(meeting, proposal, maxRounds, negotiationId, wss, traceId, participantAgents) {
+  const targetAgents = participantAgents || meeting.agentIds;
   let currentProposal = sanitizeContextTags(proposal);
   let round = 0;
-  const positions = {}; // { deptId: { stance: 'agree'|'disagree'|'modify', reason, suggestion } }
+  const positions = {}; // { agentId: { stance: 'agree'|'disagree'|'modify', reason, suggestion } }
 
   // Record proposal in meeting messages
   meeting.messages.push({
-    role: 'system', deptId: 'negotiation',
+    role: 'system', agentId: 'negotiation',
     text: `[Negotiation Started] Proposal: ${proposal}`,
     timestamp: Date.now(), negotiationId
   });
@@ -758,7 +871,7 @@ async function runNegotiation(meeting, proposal, maxRounds, negotiationId, wss, 
 
   // Broadcast negotiation start
   broadcastToMeeting(wss, meeting.id, 'meeting:negotiation-start', {
-    meetingId: meeting.id, negotiationId, proposal, maxRounds, deptIds: targetDepts
+    meetingId: meeting.id, negotiationId, proposal, maxRounds, agentIds: targetAgents
   });
 
   while (round < maxRounds) {
@@ -766,7 +879,7 @@ async function runNegotiation(meeting, proposal, maxRounds, negotiationId, wss, 
     const roundPositions = {};
 
     // Each department evaluates the proposal
-    for (const deptId of targetDepts) {
+    for (const agentId of targetAgents) {
       const prompt = round === 1
         ? `[Negotiation Mode - Round ${round}/${maxRounds}]
 You are evaluating this proposal: "${currentProposal}"
@@ -787,7 +900,7 @@ Based on your department's expertise and considering other departments' position
 Try to find common ground. Be concise.`;
 
       try {
-        const result = await chat(deptId, prompt, null, { traceId });
+        const result = await chatAgent(agentId, prompt, null, { traceId, scope: `meeting:${meeting.id}` });
         let parsed;
         if (!result.success || !result.reply) {
           parsed = { stance: 'abstain', reason: result.error || 'No response', suggestion: '' };
@@ -801,12 +914,12 @@ Try to find common ground. Be concise.`;
           }
         }
 
-        roundPositions[deptId] = parsed;
-        positions[deptId] = parsed;
+        roundPositions[agentId] = parsed;
+        positions[agentId] = parsed;
 
         // Record in meeting messages (null-safe field access)
         meeting.messages.push({
-          role: 'dept', deptId,
+          role: 'agent', agentId,
           text: `[Round ${round}] ${String(parsed.stance || 'abstain').toUpperCase()}: ${parsed.reason || ''}${parsed.suggestion ? '\nSuggestion: ' + parsed.suggestion : ''}`,
           timestamp: Date.now(), negotiationId
         });
@@ -814,11 +927,11 @@ Try to find common ground. Be concise.`;
 
         // Broadcast each dept's position
         broadcastToMeeting(wss, meeting.id, 'meeting:negotiation-vote', {
-          meetingId: meeting.id, negotiationId, round, deptId,
+          meetingId: meeting.id, negotiationId, round, agentId,
           stance: parsed.stance, reason: parsed.reason, suggestion: parsed.suggestion
         });
       } catch (err) {
-        roundPositions[deptId] = { stance: 'abstain', reason: 'Error: ' + err.message, suggestion: '' };
+        roundPositions[agentId] = { stance: 'abstain', reason: 'Error: ' + err.message, suggestion: '' };
       }
     }
 
@@ -838,8 +951,8 @@ Try to find common ground. Be concise.`;
     if (agreeCount === total) {
       // Consensus reached!
       meeting.messages.push({
-        role: 'system', deptId: 'negotiation',
-        text: `[Consensus Reached in Round ${round}] All ${total} departments agree on: ${currentProposal}`,
+        role: 'system', agentId: 'negotiation',
+        text: `[Consensus Reached in Round ${round}] All ${total} agents agree on: ${currentProposal}`,
         timestamp: Date.now(), negotiationId
       });
       persistMeeting(meeting);
@@ -869,7 +982,7 @@ Try to find common ground. Be concise.`;
   const result = agreeCount > finalStances.length / 2 ? 'majority' : 'no-consensus';
 
   meeting.messages.push({
-    role: 'system', deptId: 'negotiation',
+    role: 'system', agentId: 'negotiation',
     text: `[Negotiation Complete - ${result === 'majority' ? 'Majority Agreement' : 'No Consensus'}] After ${maxRounds} rounds: ${agreeCount}/${finalStances.length} agree`,
     timestamp: Date.now(), negotiationId
   });
@@ -888,6 +1001,167 @@ Try to find common ground. Be concise.`;
 function broadcastToMeeting(wss, meetingId, event, data) {
   if (!wss) return;
   safeBroadcast(wss, { event, data, timestamp: new Date().toISOString() });
+}
+
+/**
+ * POST /api/meetings/auto
+ * 自动开会：建会后主持人发起、其余 agent 依次回应，多轮自主讨论。
+ * Body: { topic: string, agentIds: string[], initiatorAgentId?: string, rounds?: number }
+ */
+router.post('/auto', async (req, res) => {
+  const { topic, agentIds, initiatorAgentId, rounds } = req.body;
+  if (!topic || typeof topic !== 'string' || !Array.isArray(agentIds) || agentIds.length < 2) {
+    return res.status(400).json({ error: 'topic and at least 2 agentIds required' });
+  }
+  if (topic.length > 500) {
+    return res.status(400).json({ error: 'topic must be 500 characters or less' });
+  }
+  if (agentIds.length > 20 || !agentIds.every(id => typeof id === 'string' && id.length <= 50)) {
+    return res.status(400).json({ error: 'invalid agentIds' });
+  }
+
+  const roundsCapped = Math.min(Math.max(1, parseInt(rounds, 10) || 3), 8);
+  const initiator = typeof initiatorAgentId === 'string' && agentIds.includes(initiatorAgentId)
+    ? initiatorAgentId
+    : agentIds[0];
+
+  const result = await withMutex('meeting-creation', async () => {
+    // Auto-end all existing active meetings before creating a new one (only 1 active at a time)
+    const activeMeetings = [...meetings.values()].filter(m => m.status === 'active');
+    for (const oldMtg of activeMeetings) {
+      oldMtg.status = 'ended';
+      oldMtg.endedAt = Date.now();
+      await persistMeeting(oldMtg);
+      log.info(`Auto-ended ${oldMtg.id} (new auto meeting starting)`);
+      recordAudit({ action: 'meeting:auto-end', target: oldMtg.id, details: { reason: 'superseded' }, ip: req.ip });
+    }
+    const meetingId = 'mtg_' + randomUUID().replace(/-/g, '').substring(0, 12);
+    const meeting = {
+      id: meetingId,
+      topic,
+      agentIds,
+      initiatorAgentId: initiator,
+      messages: [],
+      status: 'active',
+      createdAt: Date.now(),
+      mode: 'auto',
+    };
+    meetings.set(meetingId, meeting);
+    await persistMeeting(meeting);
+    log.info(`Auto meeting created ${meetingId}: ${topic} with ${agentIds.join(', ')}`);
+    recordAudit({ action: 'meeting:auto:create', target: meetingId, details: { topic, agentIds, rounds: roundsCapped }, ip: req.ip });
+    return { error: false, meeting, meetingId };
+  });
+
+  if (result.error) {
+    return res.status(result.status).json(result.data);
+  }
+  const { meeting, meetingId } = result;
+
+  const wss = req.app.locals.wss;
+  if (wss) {
+    safeBroadcast(wss, {
+      event: 'meeting:start',
+      data: { meetingId, topic: meeting.topic, agentIds: meeting.agentIds, mode: 'auto' },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  res.json({
+    success: true,
+    meetingId,
+    topic: meeting.topic,
+    agentIds: meeting.agentIds,
+    initiatorAgentId: initiator,
+    rounds: roundsCapped,
+  });
+
+  // Process discussion in background
+  setImmediate(async () => {
+    try {
+      await withMutex(`meeting:${meetingId}`, () => runAutoDiscussion(meeting, roundsCapped, initiator, wss, req.traceId));
+    } catch (err) {
+      log.error(`Auto meeting discussion error: ${err.message}`);
+    }
+  });
+});
+
+/**
+ * Run autonomous multi-round discussion for an auto meeting.
+ * Host (initiator) drives each round; remaining agents respond sequentially.
+ */
+async function runAutoDiscussion(meeting, rounds, initiator, wss, traceId) {
+  const others = meeting.agentIds.filter(id => id !== initiator);
+  const safeTopic = sanitizeContextTags(meeting.topic);
+
+  const buildRecent = (limit = 12) => meeting.messages.slice(-limit).map(m => {
+    const sender = m.agentId === 'user' ? '用户' : m.agentId;
+    return `[${sender}]: ${m.text}`;
+  }).join('\n');
+
+  const cap = () => {
+    if (meeting.messages.length > MAX_MESSAGES_PER_MEETING) {
+      meeting.messages = [...meeting.messages.slice(0, 10), ...meeting.messages.slice(-(MAX_MESSAGES_PER_MEETING - 10))];
+    }
+  };
+
+  const callOne = (agentId, prompt) => Promise.race([
+    chatAgent(agentId, prompt, null, { traceId, scope: `meeting:${meeting.id}` }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Agent response timeout')), DEPT_RESPONSE_TIMEOUT)),
+  ]);
+
+  for (let round = 1; round <= rounds; round++) {
+    // 1. 主持人推进讨论
+    const hostPrompt = `[会议模式-自主讨论] 主题: <user_topic>${safeTopic}</user_topic>
+参会成员: ${meeting.agentIds.join(', ')}
+现在是第 ${round}/${rounds} 轮。你作为会议主持人，基于下面的最近对话，提出一个推动 ROI 方案讨论的关键问题或观点（不要重复已讨论内容）。简洁，不超过150字。
+
+最近对话:
+${buildRecent()}`;
+
+    const hostResult = await callOne(initiator, hostPrompt);
+    const hostText = hostResult?.success ? hostResult.reply : `[Error] ${hostResult?.error || 'no response'}`;
+    meeting.messages.push({ role: 'agent', agentId: initiator, text: hostText, timestamp: Date.now() });
+    cap();
+    await persistMeeting(meeting);
+    broadcastToMeeting(wss, meeting.id, 'meeting:agent-response', {
+      meetingId: meeting.id, agentId: initiator, text: hostText, round,
+      agentIndex: 0, totalAgents: meeting.agentIds.length, timestamp: Date.now(),
+    });
+
+    // 2. 其余 agent 依次回应
+    for (let i = 0; i < others.length; i++) {
+      const agentId = others[i];
+      const prompt = `[会议模式] 主题: <user_topic>${safeTopic}</user_topic>
+参会成员: ${meeting.agentIds.join(', ')}
+第 ${round}/${rounds} 轮。请根据你的专长回应会议中关于 ROI 方案的讨论，注意其他成员已发表的观点，不要重复，提出你的独特视角。简洁，不超过200字。
+
+最近对话:
+${buildRecent()}`;
+
+      const result = await callOne(agentId, prompt);
+      const reply = result?.success ? result.reply : `[Error] ${result?.error || 'no response'}`;
+      meeting.messages.push({ role: 'agent', agentId, text: reply, timestamp: Date.now() });
+      cap();
+      await persistMeeting(meeting);
+      broadcastToMeeting(wss, meeting.id, 'meeting:agent-response', {
+        meetingId: meeting.id, agentId, text: reply, round,
+        agentIndex: i + 1, totalAgents: meeting.agentIds.length, timestamp: Date.now(),
+      });
+    }
+  }
+
+  meeting.status = 'ended';
+  meeting.endedAt = Date.now();
+  await persistMeeting(meeting);
+  if (wss) {
+    safeBroadcast(wss, {
+      event: 'meeting:end',
+      data: { meetingId: meeting.id, agentIds: meeting.agentIds },
+      timestamp: new Date().toISOString(),
+    });
+  }
+  log.info(`Auto meeting ${meeting.id} finished (${rounds} rounds)`);
 }
 
 export default router;

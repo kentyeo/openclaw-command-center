@@ -1044,6 +1044,7 @@ export const en: Record<string, string> = {
   'meeting.negotiate.placeholder': 'Enter proposal for departments to discuss...',
   'meeting.title': 'Meeting Room',
   'meeting.endMeeting': 'End Meeting',
+  'meeting.system': 'System',
   'meeting.create': '+ New Meeting',
   'meeting.empty': 'No active meetings',
   'meeting.messages': '{count} messages',
@@ -1061,6 +1062,8 @@ export const en: Record<string, string> = {
   'meeting.user': 'You',
   'meeting.negotiationSystem': 'Negotiation System',
   'meeting.roundProgress': 'Round {current}/{max}',
+  'meeting.roundParticipants': 'This round:',
+  'meeting.roundAll': 'All',
 
   // Sidebar & Ops Console
   'sidebar.office': 'Office',

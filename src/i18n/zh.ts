@@ -1044,6 +1044,7 @@ export const zh: Record<string, string> = {
   'meeting.negotiate.placeholder': '输入需要各部门讨论的提案...',
   'meeting.title': '会议室',
   'meeting.endMeeting': '结束会议',
+  'meeting.system': '系统',
   'meeting.create': '+ 发起会议',
   'meeting.empty': '暂无进行中的会议',
   'meeting.messages': '{count} 条消息',
@@ -1061,6 +1062,8 @@ export const zh: Record<string, string> = {
   'meeting.user': '你',
   'meeting.negotiationSystem': '谈判系统',
   'meeting.roundProgress': '轮次 {current}/{max}',
+  'meeting.roundParticipants': '本轮参与:',
+  'meeting.roundAll': '全员',
 
   // Sidebar & Ops Console
   'sidebar.office': '办公室',

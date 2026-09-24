@@ -1,15 +1,17 @@
-import { useEffect, useState, Component, type ReactNode, type ErrorInfo } from 'react'
+import { useEffect, useState, Component, lazy, Suspense, type ReactNode, type ErrorInfo } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useLocale } from './i18n/index'
 import { useTheme } from './hooks/useTheme'
 import { getToken, clearToken, setOnUnauthorized, authedFetch } from './utils/api'
-import { AgentStateProvider } from './contexts/AgentStateContext'
+import { AgentStateProvider, useAgentStateContext } from './contexts/AgentStateContext'
 import LoginPanel from './components/LoginPanel'
 import SetupWizard from './components/SetupWizard'
 import AppSidebar from './components/AppSidebar'
 import OfficePage from './pages/OfficePage'
 import OpsConsolePage from './pages/OpsConsolePage'
 import './App.css'
+
+const MeetingRoom = lazy(() => import('./components/MeetingRoom'))
 
 const RELOAD_THROTTLE_MS = 10000
 
@@ -60,6 +62,17 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
     }
     return this.props.children
   }
+}
+
+function MeetingOnlyPage() {
+  const agentState = useAgentStateContext()
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'var(--bg-primary)', overflowY: 'auto' }}>
+      <Suspense fallback={<div style={{ padding: 24, color: '#666', textAlign: 'center' }}>...</div>}>
+        <MeetingRoom departments={agentState.departments} onClose={() => {}} />
+      </Suspense>
+    </div>
+  )
 }
 
 export default function App() {
@@ -123,6 +136,7 @@ export default function App() {
                 <OpsConsolePage t={t} locale={locale} setLocale={setLocale}
                   theme={theme} setTheme={setTheme} onLogout={handleLogout} />
               } />
+              <Route path="/meeting-only" element={<MeetingOnlyPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </main>

@@ -62,7 +62,7 @@ const getStanceLabel = (stance: string, t: (key: string) => string): string => {
 
 interface MeetingMessage {
   role: 'user' | 'dept' | 'system'
-  deptId: string
+  agentId: string
   text: string
   timestamp: number
   negotiationId?: string
@@ -78,7 +78,7 @@ interface ActionItem {
 interface Meeting {
   id: string
   topic: string
-  deptIds: string[]
+  agentIds: string[]
   messages: MeetingMessage[]
   status: string
   createdAt: number
@@ -92,10 +92,14 @@ interface MeetingRoomProps {
 
 export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) {
   const { t, locale } = useLocale()
-  const [meetings, setMeetings] = useState<{ id: string; topic: string; deptIds: string[]; messageCount: number }[]>([])
+  const [meetings, setMeetings] = useState<{ id: string; topic: string; agentIds: string[]; messageCount: number; status?: string }[]>([])
   const [activeMeeting, setActiveMeeting] = useState<Meeting | null>(null)
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
+  const [meetingEnded, setMeetingEnded] = useState(false)
+  const [ending, setEnding] = useState(false)
+  // null = all meeting members (default, backward compatible); string[] = chosen subset for this round
+  const [targetAgentIds, setTargetAgentIds] = useState<string[] | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [newTopic, setNewTopic] = useState('')
   const [selectedDepts, setSelectedDepts] = useState<string[]>([])
@@ -120,11 +124,11 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
       .then(r => r.json())
       .then(d => {
         if (cancelled) return
-        const list = d.meetings || []
+        const list: { id: string; topic: string; agentIds: string[]; messageCount: number; status?: string }[] = d.meetings || []
         setMeetings(list)
-        if (list.length > 0) {
-          loadMeeting(list[0].id)
-        }
+        // BUG5 fix: do NOT auto-enter any meeting. Auto-entering the first
+        // active meeting made the user think they were in a private chat
+        // while their input was actually broadcast to all participants.
       })
       .catch((err) => {
         if (import.meta.env.DEV) console.warn('Fetch meetings failed:', err);
@@ -139,7 +143,11 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
     try {
       const res = await authedFetch(`/api/meetings/${id}`)
       const data = await res.json()
-      if (mountedRef.current && data.success) setActiveMeeting(data.meeting)
+      if (mountedRef.current && data.success) {
+        setActiveMeeting(data.meeting)
+        // Ended meetings open in read-only history view
+        setMeetingEnded(data.meeting.status === 'ended')
+      }
     } catch {}
   }
 
@@ -150,16 +158,17 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
       const res = await authedFetch('/api/meetings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic: newTopic.trim(), deptIds: selectedDepts }),
+        body: JSON.stringify({ topic: newTopic.trim(), agentIds: selectedDepts.map(deptToAgentId) }),
       })
       const data = await res.json()
       if (data.success) {
         setActiveMeeting(data.meeting)
         setShowCreate(false)
         const topicText = newTopic.trim()
+        const agentIds = selectedDepts.map(deptToAgentId)
         setNewTopic('')
         setSelectedDepts([])
-        setMeetings(prev => [...prev, { id: data.meetingId, topic: topicText, deptIds: selectedDepts, messageCount: 0 }])
+        setMeetings(prev => [...prev, { id: data.meetingId, topic: topicText, agentIds, messageCount: 0 }])
         // Auto-send topic as first message to kick off discussion
         await sendMeetingMessage(data.meetingId, topicText)
       }
@@ -169,20 +178,23 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
   }
 
   // Send a message to a meeting by ID (used for both manual sends and auto-topic)
-  const sendMeetingMessage = async (meetingId: string, msg: string) => {
+  // targets: null = all members (default), otherwise a chosen subset of agentIds for this round
+  const sendMeetingMessage = async (meetingId: string, msg: string, targets: string[] | null = null) => {
     setSending(true)
 
     // Optimistic: add user message
     setActiveMeeting(prev => prev ? {
       ...prev,
-      messages: [...prev.messages, { role: 'user', deptId: 'user', text: msg, timestamp: Date.now() }]
+      messages: [...prev.messages, { role: 'user', agentId: 'user', text: msg, timestamp: Date.now() }]
     } : prev)
 
     try {
+      const body: Record<string, unknown> = { message: msg }
+      if (targets && targets.length > 0) body.targetAgentIds = targets
       const res = await authedFetch(`/api/meetings/${meetingId}/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: msg }),
+        body: JSON.stringify(body),
       })
       const data = await res.json()
       if (data.status === 'accepted') {
@@ -204,23 +216,23 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
     // Don't set sending=false here for accepted, wait for round-complete event
   }
 
-  // Send message to meeting (triggers all depts to respond)
+  // Send message to meeting (triggers the chosen members to respond)
   const sendMessage = async () => {
     if (!text.trim() || !activeMeeting || sending) return
     const msg = text.trim()
+    const targets = targetAgentIds
     setText('')
-    await sendMeetingMessage(activeMeeting.id, msg)
+    // Per-round composition: reset back to all members after this round
+    setTargetAgentIds(null)
+    await sendMeetingMessage(activeMeeting.id, msg, targets)
   }
-
-  const [meetingEnded, setMeetingEnded] = useState(false)
-  const [ending, setEnding] = useState(false)
 
   // Negotiation state
   const [negotiating, setNegotiating] = useState(false)
   const [showNegotiateForm, setShowNegotiateForm] = useState(false)
   const [negotiationProposal, setNegotiationProposal] = useState('')
   const [negotiationRounds, setNegotiationRounds] = useState(3)
-  const [negotiationVotes, setNegotiationVotes] = useState<Array<{ deptId: string; stance: string; reason: string; suggestion?: string; round: number }>>([])
+  const [negotiationVotes, setNegotiationVotes] = useState<Array<{ agentId: string; stance: string; reason: string; suggestion?: string; round: number }>>([])
   const [negotiationRound, setNegotiationRound] = useState(0)
   const [negotiationMaxRounds, setNegotiationMaxRounds] = useState(3)
   const [negotiationResult, setNegotiationResult] = useState<string | null>(null)
@@ -251,7 +263,8 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
     setNegotiationAgreeCount(0)
     setNegotiationTotal(0)
     setEnding(false)
-    setMeetings(prev => prev.filter(m => m.id !== activeMeeting.id))
+    // BUG2 fix: keep the ended meeting in the list so history stays visible
+    setMeetings(prev => prev.map(m => m.id === activeMeeting.id ? { ...m, status: 'ended' } : m))
   }
 
   // Start negotiation
@@ -261,13 +274,16 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
     setNegotiationVotes([])
     setNegotiationResult(null)
     try {
+      const body: Record<string, unknown> = { proposal: negotiationProposal.trim(), maxRounds: negotiationRounds }
+      if (targetAgentIds && targetAgentIds.length > 0) body.targetAgentIds = targetAgentIds
       const res = await authedFetch(`/api/meetings/${activeMeeting.id}/negotiate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ proposal: negotiationProposal.trim(), maxRounds: negotiationRounds })
+        body: JSON.stringify(body)
       })
       const data = await res.json()
       if (data.status === 'accepted') {
+        setTargetAgentIds(null)
         setNegotiationProposal('')
         setShowNegotiateForm(false)
       }
@@ -291,7 +307,7 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
       switch (currentEvent.type) {
         case 'meeting:negotiation-vote':
           setNegotiationVotes(prev => [...prev, {
-            deptId: currentEvent.deptId,
+            agentId: currentEvent.agentId,
             stance: currentEvent.stance,
             reason: currentEvent.reason,
             suggestion: currentEvent.suggestion,
@@ -331,7 +347,7 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
 
             // Check if this message already exists (avoid duplicates)
             const exists = prev.messages.some(m =>
-              m.deptId === currentResponse.deptId &&
+              m.agentId === currentResponse.agentId &&
               m.timestamp === currentResponse.timestamp
             )
             if (exists) return prev
@@ -340,7 +356,7 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
               ...prev,
               messages: [...prev.messages, {
                 role: 'dept',
-                deptId: currentResponse.deptId,
+                agentId: currentResponse.agentId,
                 text: currentResponse.text,
                 timestamp: currentResponse.timestamp
               }]
@@ -397,18 +413,19 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
       : (tmpl.depts as string[]).filter(dId => departments.some(d => d.id === dId))
 
     if (deptIds.length < 2) return
+    const agentIds = deptIds.map(deptToAgentId)
 
     try {
       const res = await authedFetch('/api/meetings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic, deptIds }),
+        body: JSON.stringify({ topic, agentIds }),
       })
       const data = await res.json()
       if (data.success) {
         setActiveMeeting(data.meeting)
         setShowCreate(false)
-        setMeetings(prev => [...prev, { id: data.meetingId, topic, deptIds, messageCount: 0 }])
+        setMeetings(prev => [...prev, { id: data.meetingId, topic, agentIds, messageCount: 0 }])
         // Auto-send topic as first message to kick off discussion
         await sendMeetingMessage(data.meetingId, topic)
       }
@@ -418,17 +435,59 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
   }
 
   // Memoize dept helpers to prevent re-creating on every render
-  const getDeptColor = useCallback((deptId: string): string => {
-    const dept = departments.find(d => d.id === deptId)
-    return dept?.color || '#94a3b8'
+  // Meetings now use agent ids; departments are resolved via Department.agent
+  const getDeptByAgent = useCallback((agentId: string): Department | undefined => {
+    return departments.find(d => d.agent === agentId)
   }, [departments])
 
-  const getDeptName = useCallback((deptId: string): string => {
-    if (deptId === 'user') return t('meeting.user')
-    if (deptId === 'negotiation') return t('meeting.negotiationSystem')
-    if (deptId === 'action-items') return t('meeting.actionItems')
-    return departments.find(d => d.id === deptId)?.name || deptId
-  }, [departments, t])
+  const getDeptColor = useCallback((agentId: string): string => {
+    return getDeptByAgent(agentId)?.color || '#94a3b8'
+  }, [getDeptByAgent])
+
+  const getDeptName = useCallback((agentId: string): string => {
+    if (agentId === 'user') return t('meeting.user')
+    if (agentId === 'negotiation') return t('meeting.negotiationSystem')
+    if (agentId === 'action-items') return t('meeting.actionItems')
+    return getDeptByAgent(agentId)?.name || agentId
+  }, [getDeptByAgent, t])
+
+  // Map a department id (UI selection space) to the underlying agent id (backend contract)
+  const deptToAgentId = useCallback((deptId: string): string => {
+    return departments.find(d => d.id === deptId)?.agent || deptId
+  }, [departments])
+
+  // Member composition for the next round: chips above the input / in the negotiate form
+  const renderTargetChips = () => (
+    <div className="meeting-target-row">
+      <span className="meeting-target-label">{t('meeting.roundParticipants')}</span>
+      {activeMeeting!.agentIds.map(agentId => {
+        const dept = getDeptByAgent(agentId)
+        const selected = targetAgentIds === null || targetAgentIds.includes(agentId)
+        return (
+          <button
+            key={agentId}
+            className={`meeting-target-chip ${selected ? 'selected' : ''}`}
+            style={{ borderColor: selected ? (dept?.color || '#94a3b8') : undefined }}
+            onClick={() => {
+              setTargetAgentIds(prev => {
+                if (prev === null) return activeMeeting!.agentIds.filter(id => id !== agentId)
+                const next = prev.includes(agentId) ? prev.filter(id => id !== agentId) : [...prev, agentId]
+                return next.length === activeMeeting!.agentIds.length ? null : next
+              })
+            }}
+          >
+            <DeptIcon deptId={dept?.id || agentId} size={12} />
+            {dept?.name || agentId}
+          </button>
+        )
+      })}
+      {targetAgentIds !== null && (
+        <button className="meeting-target-chip all" onClick={() => setTargetAgentIds(null)}>
+          {t('meeting.roundAll')}
+        </button>
+      )}
+    </div>
+  )
 
   return (
     <div className="meeting-room-inline">
@@ -461,7 +520,8 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
                 onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); loadMeeting(m.id) } }}
               >
                 <span className="meeting-list-topic">{m.topic}</span>
-                <span className="meeting-list-depts">{m.deptIds.map(getDeptName).join(', ')}</span>
+                <span className="meeting-list-depts">{m.agentIds.map(getDeptName).join(', ')}</span>
+                {m.status === 'ended' && <span className="meeting-list-count" style={{ opacity: 0.7 }}>{t('meeting.ended')}</span>}
                 <span className="meeting-list-count">{t('meeting.messages', { count: m.messageCount })}</span>
               </div>
             ))}
@@ -529,7 +589,7 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
           <div className="meeting-ended-summary">
             <h3>{t('meeting.endedTitle', { topic: activeMeeting.topic })}</h3>
             <p className="meeting-summary-meta">
-              {t('meeting.summary.participants')}: {activeMeeting.deptIds.map(getDeptName).join(', ')} |
+              {t('meeting.summary.participants')}: {activeMeeting.agentIds.map(getDeptName).join(', ')} |
               {t('meeting.summary.messages', { count: activeMeeting.messages.length })} |
               {t('meeting.summary.duration', { minutes: Math.round((Date.now() - activeMeeting.createdAt) / 1000 / 60) })}
             </p>
@@ -562,14 +622,19 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
 
             <div className="meeting-minutes">
               <h4>{t('meeting.minutesTitle')}</h4>
-              {activeMeeting.messages.map((msg, i) => (
-                <div key={i} className="meeting-minute-item">
-                  <span className="meeting-minute-sender" style={{ color: getDeptColor(msg.deptId) }}>
-                    [{getDeptName(msg.deptId)}]
-                  </span>
-                  <span className="meeting-minute-text">{msg.text}</span>
-                </div>
-              ))}
+              {activeMeeting.messages.map((msg, i) => {
+                // BUG3 fix: system records (join/leave, negotiation, action
+                // items) render as muted 系统 entries, not as speaker lines.
+                const isSystem = msg.role === 'system' || msg.agentId === 'system' || msg.agentId === 'action-items' || msg.agentId === 'negotiation'
+                return (
+                  <div key={i} className="meeting-minute-item">
+                    <span className="meeting-minute-sender" style={{ color: isSystem ? 'var(--text-muted)' : getDeptColor(msg.agentId) }}>
+                      {isSystem ? `[${t('meeting.system')}]` : `[${getDeptName(msg.agentId)}]`}
+                    </span>
+                    <span className="meeting-minute-text" style={isSystem ? { opacity: 0.7 } : undefined}>{msg.text}</span>
+                  </div>
+                )
+              })}
               {activeMeeting.messages.length === 0 && <p className="meeting-empty">{t('meeting.noMessages')}</p>}
             </div>
             <button className="meeting-btn" onClick={() => { setDriveLink(null); setActiveMeeting(null); setMeetingEnded(false) }}>
@@ -582,9 +647,9 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
           <>
             {/* Participant badges */}
             <div className="meeting-participants">
-              {activeMeeting.deptIds.map(id => (
+              {activeMeeting.agentIds.map(id => (
                 <span key={id} className="meeting-participant" style={{ borderColor: getDeptColor(id) }}>
-                  <DeptIcon deptId={id} size={12} />
+                  <DeptIcon deptId={getDeptByAgent(id)?.id || id} size={12} />
                   {getDeptName(id)}
                 </span>
               ))}
@@ -596,7 +661,7 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
                 // Negotiation system messages
                 if (msg.negotiationId && msg.role === 'system') {
                   return (
-                    <div key={`${msg.deptId}-${msg.timestamp}-${i}`} className="negotiation-system-msg">
+                    <div key={`${msg.agentId}-${msg.timestamp}-${i}`} className="negotiation-system-msg">
                       <div className="meeting-msg-text" style={{ background: 'var(--bg-panel)', borderLeft: '3px solid var(--accent-color)' }}>
                         {msg.text}
                       </div>
@@ -612,10 +677,10 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
                     const lines = msg.text.split('\n')
                     const suggestion = lines[1]?.startsWith('Suggestion:') ? lines[1].substring(12).trim() : ''
                     return (
-                      <div key={`${msg.deptId}-${msg.timestamp}-${i}`} className="negotiation-vote" style={{ borderColor: getStanceColor(stance) }}>
+                      <div key={`${msg.agentId}-${msg.timestamp}-${i}`} className="negotiation-vote" style={{ borderColor: getStanceColor(stance) }}>
                         <div className="negotiation-vote-header">
-                          <DeptIcon deptId={msg.deptId} size={14} />
-                          <span className="negotiation-vote-dept" style={{ color: getDeptColor(msg.deptId) }}>{getDeptName(msg.deptId)}</span>
+                          <DeptIcon deptId={getDeptByAgent(msg.agentId)?.id || msg.agentId} size={14} />
+                          <span className="negotiation-vote-dept" style={{ color: getDeptColor(msg.agentId) }}>{getDeptName(msg.agentId)}</span>
                           <span className="negotiation-vote-stance" style={{ color: getStanceColor(stance) }}>{getStanceLabel(stance, t)}</span>
                         </div>
                         <div className="negotiation-vote-reason">{reason}</div>
@@ -626,11 +691,11 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
                 }
                 // Regular messages
                 return (
-                  <div key={`${msg.deptId}-${msg.timestamp}-${i}`} className={`meeting-msg ${msg.deptId === 'user' ? 'user' : 'dept'}`}>
+                  <div key={`${msg.agentId}-${msg.timestamp}-${i}`} className={`meeting-msg ${msg.agentId === 'user' ? 'user' : 'dept'}`}>
                     <div className="meeting-msg-meta">
-                      {msg.deptId !== 'user' && <DeptIcon deptId={msg.deptId} size={12} />}
-                      <span className="meeting-msg-sender" style={{ color: getDeptColor(msg.deptId) }}>
-                        {getDeptName(msg.deptId)}
+                      {msg.agentId !== 'user' && <DeptIcon deptId={getDeptByAgent(msg.agentId)?.id || msg.agentId} size={12} />}
+                      <span className="meeting-msg-sender" style={{ color: getDeptColor(msg.agentId) }}>
+                        {getDeptName(msg.agentId)}
                       </span>
                       <span className="meeting-msg-time">
                         {new Date(msg.timestamp).toLocaleTimeString(locale === 'zh' ? 'zh-CN' : 'en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}
@@ -684,6 +749,7 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
                   aria-label="协商提案"
                   rows={3}
                 />
+                {renderTargetChips()}
                 <div className="meeting-negotiate-form-row">
                   <label>
                     {t('meeting.negotiate.rounds')}:
@@ -699,6 +765,9 @@ export default function MeetingRoom({ departments, onClose }: MeetingRoomProps) 
                 </div>
               </div>
             )}
+
+            {/* Round member composition */}
+            {renderTargetChips()}
 
             {/* Input */}
             <div className="meeting-input-row">
