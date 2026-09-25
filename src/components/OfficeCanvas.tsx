@@ -363,6 +363,8 @@ export default function OfficeCanvas({ departments, selectedDeptId, onSelectDept
           .filter((idx) => idx >= 0)
 
         participants.forEach((agentIdx) => {
+          state.setAgentActive(agentIdx, false)
+          state.setAgentEmotion(agentIdx, null)
           state.clearSpeechBubble(agentIdx)
           state.sendToSeat(agentIdx)
         })
