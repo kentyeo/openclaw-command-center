@@ -896,12 +896,9 @@ class GatewayClient {
         return;
       }
 
-      // Check if pong is stale (no response for N heartbeat intervals)
-      // 2026-09-25 fix: gateway event loop can freeze 65-240s during agent LLM calls;
-      // 2x (50s) was too short, causing CC to force-disconnect mid-stream.
-      // 10x (250s) covers worst measured freeze (240s workspace init).
+      // Check if pong is stale (no response for 2 heartbeat intervals)
       const staleness = Date.now() - this._lastPong;
-      if (staleness > HEARTBEAT_INTERVAL_MS * 10) {
+      if (staleness > HEARTBEAT_INTERVAL_MS * 2) {
         gLog.warn(`Heartbeat stale (${staleness}ms since last pong), forcing reconnect`);
         this._stopHeartbeat();
         if (this.ws) {
