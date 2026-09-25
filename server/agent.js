@@ -620,7 +620,8 @@ async function chatAgent(agentId, userMessage, images, options = {}) {
 
   if (!gateway.isReady) {
     try {
-      await gateway.waitForReady(15000);
+      // Fix C: 90s — 覆盖重启后 command-center 重连 OpenClaw 的窗口（原来 15s 太短，会导致发送立即失败）
+      await gateway.waitForReady(90000);
     } catch {
       return { success: false, error: 'Gateway not connected, please try again later' };
     }

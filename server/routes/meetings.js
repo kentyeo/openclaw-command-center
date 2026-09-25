@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
-import { chatAgent, sanitizeContextTags } from '../agent.js';
+import { chatAgent, getAgentSessionKey, sanitizeContextTags } from '../agent.js';
+import { getGateway } from '../gateway.js';
 import { hasDriveAuth, getDriveClient, getOrCreateBackupFolder, getDriveConfig } from './drive.js';
 import { notify } from './notifications.js';
 import { Readable } from 'stream';
@@ -25,8 +26,147 @@ const MAX_MESSAGES_PER_MEETING = 200;  // H7 Fix: Cap at 200 messages
 
 // Meeting ID format: mtg_ + 12 hex chars
 const VALID_MEETING_ID = /^mtg_[a-f0-9]{12}$/;
-const DEPT_RESPONSE_TIMEOUT = 60000; // 60s — skip slow agents (Kimi daytime rate limiting)
+const DEPT_RESPONSE_TIMEOUT = 180000; // 180s — 球赛分析需要较长推理时间，60s 不够
 const NEGOTIATION_TIMEOUT = 600000; // 10 minutes
+
+// Fix A: 超时后继续认领迟到回复（agent run 在 OpenClaw 侧会跑完，回复不能被丢弃）
+const LATE_REPLY_POLL_INTERVAL_MS = 30000;
+const LATE_REPLY_MAX_WAIT_MS = 600000; // 最长认领 10 分钟
+// Fix B: 会议轮次 mutex 必须活得比一整轮更久（agents × DEPT_RESPONSE_TIMEOUT + 余量），
+// 否则排队中的消息会在锁等待期间被静默丢弃
+const MEETING_ROUND_MUTEX_TIMEOUT_MS = 1200000; // 20 minutes
+
+// ---- Fix A: 迟到回复认领 ----
+// lateReplyClaimed: `${meetingId}:${agentId}:${epoch}` — 防止同一轮重复回填
+// lateReplyTimersMap: meetingId -> Map<agentId, timer>（纯运行时结构，不参与 JSON 序列化）
+// activeClaims: `${meetingId}:${agentId}` -> epoch，用于戳掉旧 timer 的在途回调（防串台）
+const lateReplyClaimed = new Set();
+const lateReplyTimersMap = new Map();
+const activeClaims = new Map();
+let claimEpochCounter = 0;
+
+async function backfillLateReply(meeting, agentId, wss, rawText, roundId, key) {
+  // Fix 2: 会议已结束则放弃回填 — 防止向已结束会议追加消息/写盘/广播
+  if (meeting.status === 'ended' || lateReplyClaimed.has(key) || !rawText) return;
+  lateReplyClaimed.add(key);
+
+  const { reasoning, conclusion } = parseAgentReply(rawText);
+  const reply = `【迟到回复·超时后补记】${rawText}`;
+  meeting.messages.push({
+    role: 'agent',
+    agentId,
+    text: reply,
+    reasoning,
+    conclusion,
+    late: true,
+    timestamp: Date.now(),
+  });
+  if (meeting.messages.length > MAX_MESSAGES_PER_MEETING) {
+    const first10 = meeting.messages.slice(0, 10);
+    const lastN = meeting.messages.slice(-(MAX_MESSAGES_PER_MEETING - 10));
+    meeting.messages = [...first10, ...lastN];
+  }
+  try { await persistMeeting(meeting); } catch { /* ignore */ }
+  log.info(`Late reply from ${agentId} backfilled into ${meeting.id}`);
+  if (wss) {
+    safeBroadcast(wss, {
+      event: 'meeting:agent-response',
+      data: {
+        meetingId: meeting.id,
+        agentId,
+        text: reply,
+        reasoning,
+        conclusion,
+        roundId: roundId || null,
+        late: true,
+        timestamp: Date.now(),
+      },
+    });
+  }
+}
+
+function clearLateReplyTimers(meeting) {
+  const timers = lateReplyTimersMap.get(meeting.id);
+  if (timers) {
+    for (const t of timers.values()) clearInterval(t);
+    lateReplyTimersMap.delete(meeting.id);
+  }
+  // Fix: 同步清除该会议所有 epoch 的认领标记，防止旧 key 残留导致跨轮串台
+  // meetingId 固定长度（mtg_+12hex），前缀匹配 = 精确匹配
+  const prefix = `${meeting.id}:`;
+  for (const key of lateReplyClaimed) {
+    if (key.startsWith(prefix)) lateReplyClaimed.delete(key);
+  }
+  for (const claimKey of activeClaims.keys()) {
+    if (claimKey.startsWith(prefix)) activeClaims.delete(claimKey);
+  }
+}
+
+function claimLateReply(meeting, agentId, sessionKey, agentPromise, sentAt, wss, roundId) {
+  // Fix 1(rev): epoch 每轮自增 — key 自带 epoch、绝不跨轮复用；
+  // 同时戳掉旧 timer（含在途回调），根治"第二轮起迟到回复被静默丢弃 / 旧回复串入新轮"
+  if (meeting.status === 'ended') return;
+  const claimKey = `${meeting.id}:${agentId}`;
+  claimEpochCounter += 1;
+  const epoch = claimEpochCounter;
+  activeClaims.set(claimKey, epoch);
+  const key = `${claimKey}:${epoch}`;
+  lateReplyClaimed.delete(key);
+
+  const isCurrent = () => activeClaims.get(claimKey) === epoch;
+
+  // 清掉该会议+agent 上一轮残留的 timer（模块级 Map）
+  const timers = lateReplyTimersMap.get(meeting.id);
+  const oldTimer = timers ? timers.get(agentId) : null;
+  if (oldTimer) clearInterval(oldTimer);
+
+  // 路径 1：WS 未断时，被放弃的 chatAgent promise 仍可能正常 resolve
+  if (agentPromise && typeof agentPromise.then === 'function') {
+    agentPromise
+      .then((r) => {
+        if (isCurrent() && r && r.success && r.reply) backfillLateReply(meeting, agentId, wss, r.reply, roundId, key);
+      })
+      .catch(() => {});
+  }
+
+  // 路径 2：轮询会话历史 — 覆盖 WS 断连重连（pendingRequests 被清空、promise 永不 settle）的情况
+  const deadline = Date.now() + LATE_REPLY_MAX_WAIT_MS;
+  const timer = setInterval(async () => {
+    try {
+      if (!isCurrent() || Date.now() > deadline || meeting.status === 'ended' || lateReplyClaimed.has(key)) {
+        clearInterval(timer);
+        const ts = lateReplyTimersMap.get(meeting.id);
+        if (ts) ts.delete(agentId);
+        return;
+      }
+      const gw = getGateway();
+      if (!gw.isReady) return;
+      const msgs = await gw.getChatHistory(sessionKey, 6);
+      for (let i = (msgs || []).length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.role !== 'assistant') continue;
+        let text = '';
+        if (typeof m.content === 'string') text = m.content;
+        else if (Array.isArray(m.content)) {
+          text = m.content.filter(c => c.type === 'text' && c.text).map(c => c.text).join('\n');
+        }
+        const ts = typeof m.timestamp === 'number' ? m.timestamp : (Date.parse(m.timestamp || '') || 0);
+        if (!text || ts < sentAt - 30000) continue;
+        clearInterval(timer);
+        const mts = lateReplyTimersMap.get(meeting.id);
+        if (mts) mts.delete(agentId);
+        backfillLateReply(meeting, agentId, wss, text, roundId, key);
+        return;
+      }
+    } catch { /* gateway 忙/断连 — 下一轮重试 */ }
+  }, LATE_REPLY_POLL_INTERVAL_MS);
+
+  if (!timers) {
+    lateReplyTimersMap.set(meeting.id, new Map([[agentId, timer]]));
+  } else {
+    timers.set(agentId, timer);
+  }
+}
 
 // Ensure meetings directory exists
 const MEETINGS_DIR = path.join(BASE_PATH, 'departments', 'meetings');
@@ -176,11 +316,23 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'invalid agentIds' });
   }
 
+  // Fix C: gateway 未就绪时拒绝建会，避免产生所有发送必然失败的"死会议"
+  const gwForCreate = getGateway();
+  if (!gwForCreate.isReady) {
+    try { await gwForCreate.waitForReady(10000); } catch { /* 保持未就绪则拒绝 */ }
+  }
+  if (!gwForCreate.isReady) {
+    log.warn('Meeting creation rejected: OpenClaw gateway not connected');
+    return res.status(503).json({ error: 'OpenClaw gateway 未连接，无法创建会议（请确认 OpenClaw 已启动后再试）' });
+  }
+
   // Use mutex to prevent TOCTOU race condition on meeting creation
   const result = await withMutex('meeting-creation', async () => {
     // Auto-end all existing active meetings before creating a new one (only 1 active at a time)
     const activeMeetings = [...meetings.values()].filter(m => m.status === 'active');
     for (const oldMtg of activeMeetings) {
+      oldMtg._cancelRequested = true;
+      clearLateReplyTimers(oldMtg);
       oldMtg.status = 'ended';
       oldMtg.endedAt = Date.now();
       await persistMeeting(oldMtg);
@@ -297,6 +449,16 @@ router.post('/:id/message', async (req, res) => {
     return res.status(400).json({ error: 'Cannot send message to ended meeting' });
   }
 
+  // Fix C: gateway 未就绪时直接拒绝投递（消息会在会议里无声丢失，必须显式失败让调用方重发）
+  const gwForMsg = getGateway();
+  if (!gwForMsg.isReady) {
+    try { await gwForMsg.waitForReady(10000); } catch { /* 保持未就绪则拒绝 */ }
+  }
+  if (!gwForMsg.isReady) {
+    log.warn(`Message to ${req.params.id} rejected: OpenClaw gateway not connected`);
+    return res.status(503).json({ error: 'OpenClaw gateway 未连接，消息未投递（请确认 OpenClaw 已启动后重发）' });
+  }
+
   const { message, fromAgentId, targetAgentIds } = req.body;
   if (!message || typeof message !== 'string') return res.status(400).json({ error: 'message required' });
   if (message.length > 10000) {
@@ -355,6 +517,8 @@ router.post('/:id/message', async (req, res) => {
 
       // Sequential: each agent sees previous agents' responses (real discussion)
       for (let agentIndex = 0; agentIndex < targetAgents.length; agentIndex++) {
+      // Stop if meeting was ended while agents are still being processed
+      if (meeting.status === 'ended' || meeting._cancelRequested) { log.info('Meeting ended, aborting remaining agents'); break; }
       const agentId = targetAgents[agentIndex];
 
       // Rebuild context each iteration so new responses are visible
@@ -378,10 +542,14 @@ ${recentHistory}
 【结论】
 （在这里写出你的最终回答，不超过200字，简洁明确）`;
 
+      const agentSessionKey = getAgentSessionKey(agentId, `meeting:${meeting.id}`);
+      const sentAt = Date.now();
+      const agentPromise = chatAgent(agentId, meetingPrompt, null, { traceId: req.traceId, scope: `meeting:${meeting.id}` });
+
       try {
         // P0 Fix #3: Add timeout for agent response
         const result = await Promise.race([
-          chatAgent(agentId, meetingPrompt, null, { traceId: req.traceId, scope: `meeting:${meeting.id}` }),
+          agentPromise,
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error('Agent response timeout')), DEPT_RESPONSE_TIMEOUT)
           )
@@ -431,13 +599,16 @@ ${recentHistory}
           });
         }
       } catch (err) {
-        // P0 Fix #3: Handle timeout error specifically
+        // Handle timeout and rate-limit errors specifically
         const isTimeout = err.message.includes('timeout');
+        const isRateLimit = err.message.includes('429') || /rate.?limit/i.test(err.message);
         const errorReply = isTimeout
-          ? `[Timeout] ${agentId} 超过60秒未响应，跳过`
-          : `[Error] ${err.message}`;
+          ? `[Timeout] ${agentId} 超过180秒未响应，后台等待迟到回复（最长10分钟）`
+          : isRateLimit
+            ? `[限流] ${agentId} 被限流，跳过`
+            : `[Error] ${err.message}`;
 
-        log.info(`Agent ${agentId} ${isTimeout ? 'timed out' : 'error'}: ${err.message}`);
+        log.info(`Agent ${agentId} ${isTimeout ? 'timed out' : isRateLimit ? 'rate-limited' : 'error'}: ${err.message}`);
 
         // Record error in messages
         meeting.messages.push({
@@ -475,6 +646,11 @@ ${recentHistory}
             },
           });
         }
+
+        // Fix A: 超时后 run 仍在 OpenClaw 侧继续跑，回复不能被静默丢弃 — 后台认领
+        if (isTimeout) {
+          claimLateReply(meeting, agentId, agentSessionKey, agentPromise, sentAt, wss, roundId);
+        }
       }
     }
 
@@ -491,8 +667,22 @@ ${recentHistory}
         timestamp: new Date().toISOString(),
       });
     }
-    });
-    } catch (err) { log.error(`Message round error: ${err.message}`); }
+    }, { timeout: MEETING_ROUND_MUTEX_TIMEOUT_MS });
+    } catch (err) {
+      // Fix B: mutex 排队超时/队列满时不再静默吞掉 — 必须在会议里留下痕迹
+      log.error(`Message round error: ${err.message}`);
+      try {
+        const sysMsg = `[系统] 消息处理失败：${err.message}（未投递，请稍后重发）`;
+        meeting.messages.push({ role: 'agent', agentId: 'system', text: sysMsg, timestamp: Date.now() });
+        await persistMeeting(meeting);
+        if (wss) {
+          safeBroadcast(wss, {
+            event: 'meeting:agent-response',
+            data: { meetingId: meeting.id, agentId: 'system', text: sysMsg, timestamp: Date.now() },
+          });
+        }
+      } catch { /* ignore */ }
+    }
   });
 });
 
@@ -590,26 +780,41 @@ router.post('/:id/end', async (req, res) => {
   const meeting = meetings.get(req.params.id);
   if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
 
-  let actionItemsSuccess = true;
+  let actionItemsSuccess = null;
   let actionItemsError = null;
 
-  // Wrap critical section in mutex to prevent race conditions
-  await withMutex(`meeting-${req.params.id}`, async () => {
-    meeting.status = 'ended';
-    meeting.endedAt = Date.now();
-    await persistMeeting(meeting);
-    log.info(`Ended ${meeting.id}: ${meeting.topic}`);
+  // 幂等：已结束会议直接返回，避免重复 extract/persist/broadcast/导出
+  if (meeting.status === 'ended') {
+    return res.json({ success: true, alreadyEnded: true, driveResult: null, actionItems: { success: null, note: 'already-ended' } });
+  }
 
-    recordAudit({ action: 'meeting:end', target: meeting.id, details: { topic: meeting.topic }, ip: req.ip });
+  // Fix 3(rev): 结束标记先行 — round 循环在 for 顶部检查 status/_cancelRequested 自然 break，
+  // 无需再与 round mutex 争锁（原实现默认 30s 超时会 500）。
+  meeting._cancelRequested = true;
+  clearLateReplyTimers(meeting);
+  meeting.status = 'ended';
+  meeting.endedAt = Date.now();
+  await persistMeeting(meeting);
+  log.info(`Ended ${meeting.id}: ${meeting.topic}`);
 
-    // P0 Fix #4: Await action item extraction BEFORE scheduling deletion
-    const wss = req.app.locals.wss;
-    try {
-      await extractActionItems(meeting, wss, req.traceId);
-    } catch (err) {
-      actionItemsSuccess = false;
-      actionItemsError = err.message;
-      log.error(`Action item extraction failed: ${err.message}`);
+  recordAudit({ action: 'meeting:end', target: meeting.id, details: { topic: meeting.topic }, ip: req.ip });
+
+  // P0 Fix #4：action items 提取改为锁外 fire-and-forget（不再阻塞结束响应）；
+  // 原实现 await 在 mutex 内且 chatAgent 无超时，gateway 卡死时会拖死结束请求。
+  const wss = req.app.locals.wss;
+  Promise.race([
+    extractActionItems(meeting, wss, req.traceId).then(() => { actionItemsSuccess = true; }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Action items extraction timeout')), 180000)),
+  ]).catch((err) => {
+    actionItemsSuccess = false;
+    actionItemsError = err.message;
+    log.error(`Action item extraction failed: ${err.message}`);
+    if (wss) {
+      safeBroadcast(wss, {
+        event: 'meeting:action-items',
+        data: { meetingId: meeting.id, actionItems: [], error: err.message },
+        timestamp: new Date().toISOString(),
+      });
     }
   });
 
@@ -1131,6 +1336,7 @@ ${buildRecent()}`;
 
     // 2. 其余 agent 依次回应
     for (let i = 0; i < others.length; i++) {
+      if (meeting.status === 'ended') { log.info('Meeting ended, aborting remaining agents'); break; }
       const agentId = others[i];
       const prompt = `[会议模式] 主题: <user_topic>${safeTopic}</user_topic>
 参会成员: ${meeting.agentIds.join(', ')}
@@ -1151,6 +1357,8 @@ ${buildRecent()}`;
     }
   }
 
+  meeting._cancelRequested = true;
+  clearLateReplyTimers(meeting);
   meeting.status = 'ended';
   meeting.endedAt = Date.now();
   await persistMeeting(meeting);
